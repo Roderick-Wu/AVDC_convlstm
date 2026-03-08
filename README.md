@@ -1,1 +1,1 @@
-fuck shti classifier
+training classifier for finding failures in avdc
