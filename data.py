@@ -5,6 +5,8 @@ import json
 from torch.utils.data import Dataset
 from PIL import Image
 import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 
 class CombinedDataset(Dataset):
@@ -154,6 +156,109 @@ class CachedFlowDataset(Dataset):
         y = torch.tensor([info['label']], dtype=torch.float32)
         
         return latent, flow_maps, t, y
+
+
+class InMemoryDataset(Dataset):
+    """
+    Loads entire dataset into RAM once at startup to eliminate all per-batch disk I/O.
+    Requires large RAM (request 350GB+ on SLURM) but makes epochs extremely fast.
+    
+    Flow maps (~141 GB) + latents (~88 GB) = ~229 GB total.
+    Pre-allocated as contiguous float32 numpy arrays for maximum throughput.
+    """
+
+    def __init__(self, episode_info_list, flow_cache_dir, normalize_latent=False,
+                 latent_mean=None, latent_std=None, num_load_workers=16):
+        """
+        Args:
+            episode_info_list: List of dicts with episode information
+            flow_cache_dir: Directory containing pre-computed flow maps
+            num_load_workers: Parallel threads for loading (default 64 recommended for Lustre)
+        """
+        n = len(episode_info_list)
+        print(f"  Loading {n:,} samples into RAM with {num_load_workers} threads...", flush=True)
+
+        # ---- probe shapes from first sample ----
+        info0 = episode_info_list[0]
+        lat0 = np.load(info0['latent_path'])
+        if lat0.ndim == 5:
+            lat0 = lat0[0]
+        flow_path0 = os.path.join(
+            flow_cache_dir, info0['task'], info0['camera'],
+            f"episode_{info0['episode']:03d}",
+            f"flow_t{info0['timestep']:03d}.npy"
+        )
+        flow0 = np.load(flow_path0)
+
+        latent_shape = lat0.shape   # (640, 7, 8, 8)
+        flow_shape   = flow0.shape  # (2, 7, H, W)
+
+        latent_mem_gb = n * lat0.astype(np.float32).nbytes / 1024**3
+        flow_mem_gb   = n * flow0.astype(np.float32).nbytes / 1024**3
+        print(f"  Latent array:  {latent_mem_gb:.1f} GB  {latent_shape}")
+        print(f"  Flow array:    {flow_mem_gb:.1f} GB  {flow_shape}")
+        print(f"  Total:         {latent_mem_gb + flow_mem_gb:.1f} GB")
+        print(f"  Estimated load time: ~{(latent_mem_gb + flow_mem_gb) / 2:.0f}-{(latent_mem_gb + flow_mem_gb):.0f} min", flush=True)
+
+        # ---- pre-allocate contiguous float32 buffers ----
+        self.latents   = np.empty((n, *latent_shape), dtype=np.float32)
+        self.flows     = np.empty((n, *flow_shape),   dtype=np.float32)
+        self.timesteps = np.empty(n, dtype=np.float32)
+        self.labels    = np.empty(n, dtype=np.float32)
+
+        # ---- parallel load via threads ----
+        # np.load releases the GIL during file I/O, so threads provide true
+        # parallelism here and hide per-file open latency on Lustre scratch.
+        lock = threading.Lock()
+        progress = [0]
+
+        def load_one(args):
+            idx, info = args
+            lat = np.load(info['latent_path'])
+            if lat.ndim == 5:
+                lat = lat[0]
+            self.latents[idx] = lat.astype(np.float32)
+
+            fp = os.path.join(
+                flow_cache_dir, info['task'], info['camera'],
+                f"episode_{info['episode']:03d}",
+                f"flow_t{info['timestep']:03d}.npy"
+            )
+            self.flows[idx] = np.load(fp).astype(np.float32)
+
+            self.timesteps[idx] = float(info['timestep'])
+            self.labels[idx]    = float(info['label'])
+
+            with lock:
+                progress[0] += 1
+                if progress[0] % 5000 == 0:
+                    print(f"    {progress[0]:,}/{n:,} loaded...", flush=True)
+
+        with ThreadPoolExecutor(max_workers=num_load_workers) as ex:
+            list(ex.map(load_one, enumerate(episode_info_list)))
+
+        print(f"  All {n:,} samples loaded into RAM.", flush=True)
+
+        # ---- optional latent normalisation ----
+        if normalize_latent and latent_mean is not None and latent_std is not None:
+            self.latents = (self.latents - latent_mean) / (latent_std + 1e-8)
+
+        # convert to torch tensors (zero-copy view of the numpy buffers)
+        self.latents   = torch.from_numpy(self.latents)
+        self.flows     = torch.from_numpy(self.flows)
+        self.timesteps = torch.from_numpy(self.timesteps)
+        self.labels    = torch.from_numpy(self.labels)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return (
+            self.latents[idx],
+            self.flows[idx],
+            self.timesteps[idx].unsqueeze(0),
+            self.labels[idx].unsqueeze(0),
+        )
 
 
 def load_video_frames(video_path):

@@ -28,6 +28,7 @@ def train_combined_model(classifier_model,
           use_cached_flows=False,
           flow_cache_dir=None,
           skip_file_check=False,
+          load_in_memory=True,
           time_mask_prob=0.0,
           normalize_latent=False,
           plot_file="loss_curve_combined.png", 
@@ -100,21 +101,41 @@ def train_combined_model(classifier_model,
         
         print(f"  Flow cache directory: {flow_cache_dir}")
         
-        train_dataset = data.CachedFlowDataset(
-            episode_info_list=train_info_list,
-            flow_cache_dir=flow_cache_dir,
-            normalize_latent=normalize_latent,
-            latent_mean=latent_mean,
-            latent_std=latent_std
-        )
-        
-        val_dataset = data.CachedFlowDataset(
-            episode_info_list=val_info_list,
-            flow_cache_dir=flow_cache_dir,
-            normalize_latent=normalize_latent,
-            latent_mean=latent_mean,
-            latent_std=latent_std
-        )
+        if load_in_memory:
+            print("\n📦 Loading ENTIRE dataset into RAM (fast epochs, ~15 min startup)...")
+            print("  Training set:")
+            train_dataset = data.InMemoryDataset(
+                episode_info_list=train_info_list,
+                flow_cache_dir=flow_cache_dir,
+                normalize_latent=normalize_latent,
+                latent_mean=latent_mean,
+                latent_std=latent_std,
+                num_load_workers=64
+            )
+            print("  Validation set:")
+            val_dataset = data.InMemoryDataset(
+                episode_info_list=val_info_list,
+                flow_cache_dir=flow_cache_dir,
+                normalize_latent=normalize_latent,
+                latent_mean=latent_mean,
+                latent_std=latent_std,
+                num_load_workers=64
+            )
+        else:
+            train_dataset = data.CachedFlowDataset(
+                episode_info_list=train_info_list,
+                flow_cache_dir=flow_cache_dir,
+                normalize_latent=normalize_latent,
+                latent_mean=latent_mean,
+                latent_std=latent_std
+            )
+            val_dataset = data.CachedFlowDataset(
+                episode_info_list=val_info_list,
+                flow_cache_dir=flow_cache_dir,
+                normalize_latent=normalize_latent,
+                latent_mean=latent_mean,
+                latent_std=latent_std
+            )
     else:
         print("\n⚠ Computing flows ON-THE-FLY (very slow!)")
         print("  Consider running precompute_flows.py first for much faster training.")
@@ -145,6 +166,10 @@ def train_combined_model(classifier_model,
     print(f"Train Dataset size: {len(train_dataset)}")
     print(f"Validation Dataset size: {len(val_dataset)}")
     
+    # Create checkpoint directory immediately so we can verify training started
+    os.makedirs(model_save_path, exist_ok=True)
+    print(f"Checkpoint directory: {model_save_path}")
+    
     # Compute class weights
     train_labels = np.array([info['label'] for info in train_info_list])
     num_negative = np.sum(train_labels == 0)
@@ -157,10 +182,11 @@ def train_combined_model(classifier_model,
     print(f"  Pos weight: {pos_weight.item():.4f}")
     
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                             num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
-                           num_workers=0, pin_memory=True)
+    # num_workers=0: data is already in RAM, workers add overhead not benefit
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                             num_workers=0, pin_memory=False)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                           num_workers=0, pin_memory=False)
     
     # Loss and optimizer
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -390,6 +416,7 @@ if __name__ == "__main__":
         use_gmflow=True,  # Only used if use_cached_flows=False
         use_cached_flows=use_cached_flows,
         flow_cache_dir=os.path.join(directory, 'flow_maps') if use_cached_flows else None,
+        load_in_memory=True,    # Load all data into RAM — eliminates disk I/O during training
         skip_file_check=skip_file_check,
         time_mask_prob=0.0,  # Set to 0.15 to enable time masking
         normalize_latent=False,  # Set to True to normalize latent embeddings

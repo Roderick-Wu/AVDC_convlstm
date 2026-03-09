@@ -4,8 +4,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=350G
 #SBATCH --gres=gpu:1
 #SBATCH --output=slurm-%j.out
 
@@ -26,6 +26,6 @@ cd /home/wuroderi/projects/def-gigor/wuroderi/classifier
 
 # Run training
 echo "Starting training..."
-python train.py
+python -u train.py
 
 echo "Training completed!"
