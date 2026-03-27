@@ -1,2 +1,4 @@
 *.out
 checkpoints_combined_convlstm/
+*.out
+*.log

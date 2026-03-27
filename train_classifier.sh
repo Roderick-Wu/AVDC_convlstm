@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=train_combined_classifier
 #SBATCH --account=def-gigor
-#SBATCH --time=48:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=350G
 #SBATCH --gres=gpu:1
 #SBATCH --output=slurm-%j.out

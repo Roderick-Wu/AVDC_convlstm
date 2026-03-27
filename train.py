@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import model
@@ -9,6 +10,38 @@ from model import CombinedClassifier, CombinedConvLSTM, random_time_masking
 import data
 import matplotlib.pyplot as plt
 from sklearn.utils.class_weight import compute_class_weight
+
+
+def supervised_contrastive_loss(embeddings, labels, temperature=0.1, eps=1e-8):
+    """
+    Supervised contrastive loss over a batch.
+
+    Pulls embeddings with the same label together and pushes different labels apart.
+    Returns zero when no valid positive pairs exist in the batch.
+    """
+    if embeddings.size(0) < 2:
+        return embeddings.new_tensor(0.0)
+
+    labels = labels.view(-1).long()
+    z = F.normalize(embeddings, dim=1)
+
+    logits = torch.matmul(z, z.T) / temperature
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+    batch_size = z.size(0)
+    self_mask = torch.eye(batch_size, device=z.device, dtype=torch.bool)
+    pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & (~self_mask)
+
+    if pos_mask.sum() == 0:
+        return embeddings.new_tensor(0.0)
+
+    exp_logits = torch.exp(logits) * (~self_mask)
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + eps)
+
+    pos_counts = pos_mask.sum(dim=1)
+    valid = pos_counts > 0
+    mean_log_prob_pos = (log_prob * pos_mask).sum(dim=1) / pos_counts.clamp_min(1)
+    return -mean_log_prob_pos[valid].mean()
 
 
 def train_combined_model(classifier_model, 
@@ -31,8 +64,13 @@ def train_combined_model(classifier_model,
           load_in_memory=True,
           time_mask_prob=0.0,
           normalize_latent=False,
+          use_contrastive_loss=False,
+          contrastive_weight=0.1,
+          contrastive_temperature=0.1,
+          contrastive_warmup_epochs=5,
           plot_file="loss_curve_combined.png", 
-          model_save_path="checkpoints_combined"
+          model_save_path="checkpoints_combined",
+          grad_accumulation_steps=1
     ):
     """
     Train combined classifier that uses both latent embeddings and flow maps.
@@ -56,8 +94,16 @@ def train_combined_model(classifier_model,
         flow_cache_dir: Directory containing cached flows (default: directory/flow_maps/)
         time_mask_prob: Probability of masking timesteps during training
         normalize_latent: Whether to normalize latent embeddings
+        use_contrastive_loss: If True, add supervised contrastive loss on final embedding
+        contrastive_weight: Weight for contrastive term in total loss
+        contrastive_temperature: Temperature for supervised contrastive loss
+        contrastive_warmup_epochs: Number of initial epochs to linearly ramp contrastive
+            weight from 0 to contrastive_weight. Set 0 to disable warmup.
         plot_file: Filename for saving loss curves
         model_save_path: Directory to save checkpoints
+        grad_accumulation_steps: Accumulate gradients over N batches before stepping.
+            Effective batch size = batch_size × grad_accumulation_steps.
+            Larger effective batches reduce gradient noise from class imbalance.
     """
     
     classifier_model = classifier_model.to(device)
@@ -190,42 +236,91 @@ def train_combined_model(classifier_model,
     
     # Loss and optimizer
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = optim.Adam(classifier_model.parameters(), lr=learning_rate)
-    
+    optimizer = optim.Adam(classifier_model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    # Halve LR if val loss doesn't improve for 3 epochs; helps escape the epoch-1 plateau
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2
+    )
+
+    effective_batch = batch_size * grad_accumulation_steps
+    print(f"Effective batch size: {effective_batch} "
+          f"(batch_size={batch_size} × accumulation_steps={grad_accumulation_steps})", flush=True)
+    print(f"Contrastive loss: {'ON' if use_contrastive_loss else 'OFF'}"
+            f" (weight={contrastive_weight}, temperature={contrastive_temperature}, "
+            f"warmup_epochs={contrastive_warmup_epochs})", flush=True)
+
     # Training loop
     train_losses, val_losses = [], []
     train_accuracies, val_accuracies = [], []
     lowest_val_loss, best_epoch = float('inf'), 0
     
     for epoch in range(epochs):
+        if use_contrastive_loss:
+            if contrastive_warmup_epochs > 0:
+                contrastive_scale = min(1.0, (epoch + 1) / contrastive_warmup_epochs)
+            else:
+                contrastive_scale = 1.0
+            current_contrastive_weight = contrastive_weight * contrastive_scale
+        else:
+            current_contrastive_weight = 0.0
+
         # Training
         classifier_model.train()
         predictions, labels, total_loss = [], [], 0
-        
+        total_cls_loss, total_ctr_loss = 0, 0
+        optimizer.zero_grad()
+
         for batch_idx, (batch_latent, batch_flow, batch_t, batch_y) in enumerate(train_loader):
             batch_latent = batch_latent.to(device)
             batch_flow = batch_flow.to(device)
             batch_t = batch_t.to(device)
             batch_y = batch_y.to(device)
-            
+
             # Optional: apply time masking for regularization
             if time_mask_prob > 0:
                 batch_latent = random_time_masking(batch_latent, mask_prob=time_mask_prob)
                 batch_flow = random_time_masking(batch_flow, mask_prob=time_mask_prob)
-            
-            optimizer.zero_grad()
-            outputs = classifier_model(batch_latent, batch_flow, batch_t)
+
+            if use_contrastive_loss:
+                outputs, embeddings = classifier_model(
+                    batch_latent, batch_flow, batch_t, return_embedding=True
+                )
+            else:
+                outputs = classifier_model(batch_latent, batch_flow, batch_t)
+                embeddings = None
             predictions.append(outputs.detach().cpu())
             labels.append(batch_y.detach().cpu())
-            
-            loss = loss_fn(outputs, batch_y)
+
+            # Scale loss so accumulated gradients match a single large-batch gradient
+            cls_loss = loss_fn(outputs, batch_y)
+            ctr_loss = (
+                supervised_contrastive_loss(
+                    embeddings, batch_y, temperature=contrastive_temperature
+                ) if use_contrastive_loss else outputs.new_tensor(0.0)
+            )
+
+            combined_loss = cls_loss + current_contrastive_weight * ctr_loss
+            loss = combined_loss / grad_accumulation_steps
             loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            
+            total_loss += combined_loss.item()
+            total_cls_loss += cls_loss.item()
+            total_ctr_loss += ctr_loss.item()
+
+            is_last_batch = (batch_idx + 1 == len(train_loader))
+            if (batch_idx + 1) % grad_accumulation_steps == 0 or is_last_batch:
+                # Clip gradients — essential for LSTM stability
+                torch.nn.utils.clip_grad_norm_(classifier_model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
             if (batch_idx + 1) % 10 == 0:
-                print(f"  Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}/{len(train_loader)}, Loss: {loss.item():.4f}")
-        
+                print(
+                    f"  Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}/{len(train_loader)}, "
+                    f"Loss: {combined_loss.item():.4f} "
+                    f"(cls: {cls_loss.item():.4f}, ctr: {ctr_loss.item():.4f}, "
+                    f"ctr_w: {current_contrastive_weight:.4f})"
+                )
+
         train_losses.append(total_loss / len(train_loader))
         predictions = torch.cat(predictions, dim=0)
         labels = torch.cat(labels, dim=0)
@@ -235,17 +330,36 @@ def train_combined_model(classifier_model,
         # Validation
         classifier_model.eval()
         predictions, labels, val_loss = [], [], 0
+        val_cls_loss, val_ctr_loss = 0, 0
         with torch.no_grad():
             for batch_latent, batch_flow, batch_t, batch_y in val_loader:
                 batch_latent = batch_latent.to(device)
                 batch_flow = batch_flow.to(device)
                 batch_t = batch_t.to(device)
                 batch_y = batch_y.to(device)
-                
-                outputs = classifier_model(batch_latent, batch_flow, batch_t)
+
+                if use_contrastive_loss:
+                    outputs, embeddings = classifier_model(
+                        batch_latent, batch_flow, batch_t, return_embedding=True
+                    )
+                else:
+                    outputs = classifier_model(batch_latent, batch_flow, batch_t)
+                    embeddings = None
+
                 predictions.append(outputs.detach().cpu())
                 labels.append(batch_y.detach().cpu())
-                val_loss += loss_fn(outputs, batch_y).item()
+
+                v_cls = loss_fn(outputs, batch_y)
+                v_ctr = (
+                    supervised_contrastive_loss(
+                        embeddings, batch_y, temperature=contrastive_temperature
+                    ) if use_contrastive_loss else outputs.new_tensor(0.0)
+                )
+                v_total = v_cls + current_contrastive_weight * v_ctr
+
+                val_loss += v_total.item()
+                val_cls_loss += v_cls.item()
+                val_ctr_loss += v_ctr.item()
         
         val_losses.append(val_loss / len(val_loader))
         predictions = torch.cat(predictions, dim=0)
@@ -253,11 +367,19 @@ def train_combined_model(classifier_model,
         val_accuracy = ((torch.sigmoid(predictions) > 0.5) == (labels > 0.5)).float().mean()
         val_accuracies.append(val_accuracy.item())
         
+        # Step scheduler based on val loss
+        scheduler.step(val_losses[-1])
+        current_lr = optimizer.param_groups[0]['lr']
+
         # Print epoch summary
         print(f"Epoch [{epoch+1}/{epochs}]")
         print(f"  Train Loss: {train_losses[-1]:.4f}, Train Acc: {train_accuracies[-1]:.4f}")
+        print(f"    Train cls: {total_cls_loss / len(train_loader):.4f}, Train ctr: {total_ctr_loss / len(train_loader):.4f}")
         print(f"  Val Loss: {val_losses[-1]:.4f}, Val Acc: {val_accuracies[-1]:.4f}")
-        
+        print(f"    Val cls: {val_cls_loss / len(val_loader):.4f}, Val ctr: {val_ctr_loss / len(val_loader):.4f}")
+        print(f"  Contrastive weight (current): {current_contrastive_weight:.4f}")
+        print(f"  LR: {current_lr:.2e}", flush=True)
+
         # Save best model
         if val_losses[-1] < lowest_val_loss:
             lowest_val_loss = val_losses[-1]
@@ -330,10 +452,17 @@ if __name__ == "__main__":
     # With val_split=0.1: ~148,500 train, ~16,500 val
     
     # Training parameters
-    epochs = 50
-    batch_size = 16  # Adjust based on GPU memory
-    learning_rate = 1e-4
+    epochs = 100
+    batch_size = 64  # Adjust based on GPU memory
+    learning_rate = 4e-6
     val_split = 0.1  # 10% validation split for multi-task training
+    grad_accumulation_steps = 1
+
+    # Optional embedding contrastive regularization
+    use_contrastive_loss = True
+    contrastive_weight = 0.03
+    contrastive_temperature = 0.1
+    contrastive_warmup_epochs = 5
     
     # IMPORTANT: Use pre-computed flows for fast training!
     # Set to True to use cached flows (MUCH faster - recommended!)
@@ -420,6 +549,11 @@ if __name__ == "__main__":
         skip_file_check=skip_file_check,
         time_mask_prob=0.0,  # Set to 0.15 to enable time masking
         normalize_latent=False,  # Set to True to normalize latent embeddings
+        use_contrastive_loss=use_contrastive_loss,
+        contrastive_weight=contrastive_weight,
+        contrastive_temperature=contrastive_temperature,
+        contrastive_warmup_epochs=contrastive_warmup_epochs,
         plot_file="loss_curve.png",
-        model_save_path=model_save_path
+        model_save_path=model_save_path,
+        grad_accumulation_steps=grad_accumulation_steps
     )

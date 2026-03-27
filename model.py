@@ -102,7 +102,7 @@ class CombinedClassifier(nn.Module):
             nn.Linear(fusion_dim // 2, 1)  # Output: single logit
         )
     
-    def forward(self, latent, flow, timestep):
+    def forward(self, latent, flow, timestep, return_embedding=False):
         """
         Args:
             latent: (B, 640, 7, 8, 8) - latent embeddings
@@ -131,8 +131,11 @@ class CombinedClassifier(nn.Module):
         combined = torch.cat([latent_feat, flow_feat, timestep_feat], dim=1)  # (B, combined_dim)
         
         # Fusion and classification
-        score = self.fusion(combined)  # (B, 1)
-        
+        embedding = self.fusion[:-1](combined)  # Penultimate embedding
+        score = self.fusion[-1](embedding)  # (B, 1)
+
+        if return_embedding:
+            return score, embedding
         return score
 
 
@@ -207,7 +210,7 @@ class CombinedConvLSTM(nn.Module):
             nn.Linear(fusion_dim // 2, 1)
         )
     
-    def forward(self, latent, flow, timestep):
+    def forward(self, latent, flow, timestep, return_embedding=False):
         """
         Args:
             latent: (B, 640, 7, 8, 8)
@@ -245,8 +248,11 @@ class CombinedConvLSTM(nn.Module):
         
         # Fuse
         combined = torch.cat([latent_hidden, flow_hidden, timestep_feat], dim=1)
-        score = self.fusion(combined)
-        
+        embedding = self.fusion[:-1](combined)  # Penultimate embedding
+        score = self.fusion[-1](embedding)
+
+        if return_embedding:
+            return score, embedding
         return score
 
 
