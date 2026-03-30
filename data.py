@@ -261,6 +261,68 @@ class InMemoryDataset(Dataset):
         )
 
 
+class LatentRawVideoDataset(Dataset):
+    """
+    Dataset for latent embeddings + raw x0 videos.
+
+    Returns:
+        latent: (640, 7, 8, 8)
+        video: (3, 8, H, W) where frame 0 is condition image
+        t: (1,)
+        y: (1,)
+    """
+
+    def __init__(self, episode_info_list, normalize_latent=False, latent_mean=None,
+                 latent_std=None, video_size=128):
+        self.episode_info_list = episode_info_list
+        self.normalize_latent = normalize_latent
+        self.latent_mean = latent_mean
+        self.latent_std = latent_std
+        self.video_size = video_size
+
+    def __len__(self):
+        return len(self.episode_info_list)
+
+    def __getitem__(self, idx):
+        info = self.episode_info_list[idx]
+
+        latent = np.load(info['latent_path'])
+        latent = torch.from_numpy(latent).float()
+        if latent.ndim == 5:
+            latent = latent[0]
+
+        if self.normalize_latent and self.latent_mean is not None and self.latent_std is not None:
+            latent = (latent - self.latent_mean) / (self.latent_std + 1e-8)
+
+        x0_frames = load_video_frames(info['x0_path'])
+        if len(x0_frames) == 8:
+            frames = x0_frames
+        elif len(x0_frames) == 7:
+            condition = load_condition_frame(info['condition_path'])
+            frames = [condition] + x0_frames
+        else:
+            raise ValueError(
+                f"Expected x0 gif with 7 or 8 frames, got {len(x0_frames)}: {info['x0_path']}"
+            )
+
+        video_tchw = torch.stack(frames, dim=0)  # (T, C, H, W)
+        if self.video_size is not None and (
+            video_tchw.shape[-2] != self.video_size or video_tchw.shape[-1] != self.video_size
+        ):
+            video_tchw = F.interpolate(
+                video_tchw,
+                size=(self.video_size, self.video_size),
+                mode='bilinear',
+                align_corners=False,
+            )
+        video = video_tchw.permute(1, 0, 2, 3).contiguous()  # (C, T, H, W)
+
+        t = torch.tensor([info['timestep']], dtype=torch.float32)
+        y = torch.tensor([info['label']], dtype=torch.float32)
+
+        return latent, video, t, y
+
+
 def load_video_frames(video_path):
     """
     Load all frames from a GIF video.

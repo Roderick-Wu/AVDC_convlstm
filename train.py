@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import model
-from model import CombinedClassifier, CombinedConvLSTM, random_time_masking
+from model import CombinedClassifier, CombinedConvLSTM, LatentVideoTransformer, random_time_masking
 import data
 import matplotlib.pyplot as plt
 from sklearn.utils.class_weight import compute_class_weight
@@ -423,6 +423,283 @@ def train_combined_model(classifier_model,
     print(f"Best model at epoch {best_epoch} with val loss: {lowest_val_loss:.4f}")
 
 
+def train_latent_video_transformer_model(
+          classifier_model,
+          epochs,
+          batch_size,
+          learning_rate,
+          device,
+          val_split,
+          directory,
+          task_list,
+          camera_list,
+          episodes,
+          diffusion_time_steps,
+          results_json,
+          skip_file_check=False,
+          normalize_latent=False,
+          video_size=128,
+          num_workers=8,
+          use_contrastive_loss=False,
+          contrastive_weight=0.1,
+          contrastive_temperature=0.1,
+          contrastive_warmup_epochs=5,
+          plot_file="loss_curve_latent_video_transformer.png",
+          model_save_path="checkpoints_latent_video_transformer",
+          grad_accumulation_steps=1
+    ):
+    """
+    Train Transformer classifier using latent embeddings + raw x0 videos.
+
+    Video branch expects 8 frames. If an x0 gif has only 7 predicted frames, the
+    dataset prepends the condition frame to build an 8-frame sequence.
+    """
+
+    classifier_model = classifier_model.to(device)
+
+    print("Creating episode info list...")
+    episode_info_list = data.create_episode_info_list(
+        directory=directory,
+        tasks=task_list,
+        cameras=camera_list,
+        episodes=episodes,
+        diffusion_time_steps=diffusion_time_steps,
+        results_json=results_json,
+        skip_file_check=skip_file_check
+    )
+
+    train_info_list, val_info_list = data.episode_aware_split(
+        episode_info_list,
+        val_split=val_split,
+        num_cameras=len(camera_list),
+        num_diffusion_steps=len(diffusion_time_steps)
+    )
+
+    latent_mean, latent_std = None, None
+    if normalize_latent:
+        latent_mean, latent_std = data.compute_latent_statistics(train_info_list, sample_size=100)
+
+    train_dataset = data.LatentRawVideoDataset(
+        episode_info_list=train_info_list,
+        normalize_latent=normalize_latent,
+        latent_mean=latent_mean,
+        latent_std=latent_std,
+        video_size=video_size,
+    )
+    val_dataset = data.LatentRawVideoDataset(
+        episode_info_list=val_info_list,
+        normalize_latent=normalize_latent,
+        latent_mean=latent_mean,
+        latent_std=latent_std,
+        video_size=video_size,
+    )
+
+    print(f"Train Dataset size: {len(train_dataset)}")
+    print(f"Validation Dataset size: {len(val_dataset)}")
+
+    os.makedirs(model_save_path, exist_ok=True)
+    print(f"Checkpoint directory: {model_save_path}")
+
+    train_labels = np.array([info['label'] for info in train_info_list])
+    num_negative = np.sum(train_labels == 0)
+    num_positive = np.sum(train_labels == 1)
+    pos_weight = torch.tensor([num_negative / max(num_positive, 1)], device=device)
+
+    print(f"\nClass distribution:")
+    print(f"  Negative (failure): {num_negative} ({100*num_negative/len(train_labels):.2f}%)")
+    print(f"  Positive (success): {num_positive} ({100*num_positive/len(train_labels):.2f}%)")
+    print(f"  Pos weight: {pos_weight.item():.4f}")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(num_workers > 0),
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(num_workers > 0),
+    )
+
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.Adam(classifier_model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2
+    )
+
+    effective_batch = batch_size * grad_accumulation_steps
+    print(f"Effective batch size: {effective_batch} "
+          f"(batch_size={batch_size} × accumulation_steps={grad_accumulation_steps})", flush=True)
+    print(f"Contrastive loss: {'ON' if use_contrastive_loss else 'OFF'}"
+            f" (weight={contrastive_weight}, temperature={contrastive_temperature}, "
+            f"warmup_epochs={contrastive_warmup_epochs})", flush=True)
+
+    train_losses, val_losses = [], []
+    train_accuracies, val_accuracies = [], []
+    lowest_val_loss, best_epoch = float('inf'), 0
+
+    for epoch in range(epochs):
+        if use_contrastive_loss:
+            if contrastive_warmup_epochs > 0:
+                contrastive_scale = min(1.0, (epoch + 1) / contrastive_warmup_epochs)
+            else:
+                contrastive_scale = 1.0
+            current_contrastive_weight = contrastive_weight * contrastive_scale
+        else:
+            current_contrastive_weight = 0.0
+
+        classifier_model.train()
+        predictions, labels, total_loss = [], [], 0
+        total_cls_loss, total_ctr_loss = 0, 0
+        optimizer.zero_grad()
+
+        for batch_idx, (batch_latent, batch_video, batch_t, batch_y) in enumerate(train_loader):
+            batch_latent = batch_latent.to(device)
+            batch_video = batch_video.to(device)
+            batch_t = batch_t.to(device)
+            batch_y = batch_y.to(device)
+
+            if use_contrastive_loss:
+                outputs, embeddings = classifier_model(
+                    batch_latent, batch_video, batch_t, return_embedding=True
+                )
+            else:
+                outputs = classifier_model(batch_latent, batch_video, batch_t)
+                embeddings = None
+
+            predictions.append(outputs.detach().cpu())
+            labels.append(batch_y.detach().cpu())
+
+            cls_loss = loss_fn(outputs, batch_y)
+            ctr_loss = (
+                supervised_contrastive_loss(
+                    embeddings, batch_y, temperature=contrastive_temperature
+                ) if use_contrastive_loss else outputs.new_tensor(0.0)
+            )
+
+            combined_loss = cls_loss + current_contrastive_weight * ctr_loss
+            loss = combined_loss / grad_accumulation_steps
+            loss.backward()
+            total_loss += combined_loss.item()
+            total_cls_loss += cls_loss.item()
+            total_ctr_loss += ctr_loss.item()
+
+            is_last_batch = (batch_idx + 1 == len(train_loader))
+            if (batch_idx + 1) % grad_accumulation_steps == 0 or is_last_batch:
+                torch.nn.utils.clip_grad_norm_(classifier_model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            if (batch_idx + 1) % 10 == 0:
+                print(
+                    f"  Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}/{len(train_loader)}, "
+                    f"Loss: {combined_loss.item():.4f} "
+                    f"(cls: {cls_loss.item():.4f}, ctr: {ctr_loss.item():.4f}, "
+                    f"ctr_w: {current_contrastive_weight:.4f})"
+                )
+
+        train_losses.append(total_loss / len(train_loader))
+        predictions = torch.cat(predictions, dim=0)
+        labels = torch.cat(labels, dim=0)
+        train_accuracy = ((torch.sigmoid(predictions) > 0.5) == (labels > 0.5)).float().mean()
+        train_accuracies.append(train_accuracy.item())
+
+        classifier_model.eval()
+        predictions, labels, val_loss = [], [], 0
+        val_cls_loss, val_ctr_loss = 0, 0
+        with torch.no_grad():
+            for batch_latent, batch_video, batch_t, batch_y in val_loader:
+                batch_latent = batch_latent.to(device)
+                batch_video = batch_video.to(device)
+                batch_t = batch_t.to(device)
+                batch_y = batch_y.to(device)
+
+                if use_contrastive_loss:
+                    outputs, embeddings = classifier_model(
+                        batch_latent, batch_video, batch_t, return_embedding=True
+                    )
+                else:
+                    outputs = classifier_model(batch_latent, batch_video, batch_t)
+                    embeddings = None
+
+                predictions.append(outputs.detach().cpu())
+                labels.append(batch_y.detach().cpu())
+
+                v_cls = loss_fn(outputs, batch_y)
+                v_ctr = (
+                    supervised_contrastive_loss(
+                        embeddings, batch_y, temperature=contrastive_temperature
+                    ) if use_contrastive_loss else outputs.new_tensor(0.0)
+                )
+                v_total = v_cls + current_contrastive_weight * v_ctr
+
+                val_loss += v_total.item()
+                val_cls_loss += v_cls.item()
+                val_ctr_loss += v_ctr.item()
+
+        val_losses.append(val_loss / len(val_loader))
+        predictions = torch.cat(predictions, dim=0)
+        labels = torch.cat(labels, dim=0)
+        val_accuracy = ((torch.sigmoid(predictions) > 0.5) == (labels > 0.5)).float().mean()
+        val_accuracies.append(val_accuracy.item())
+
+        scheduler.step(val_losses[-1])
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"Epoch [{epoch+1}/{epochs}]")
+        print(f"  Train Loss: {train_losses[-1]:.4f}, Train Acc: {train_accuracies[-1]:.4f}")
+        print(f"    Train cls: {total_cls_loss / len(train_loader):.4f}, Train ctr: {total_ctr_loss / len(train_loader):.4f}")
+        print(f"  Val Loss: {val_losses[-1]:.4f}, Val Acc: {val_accuracies[-1]:.4f}")
+        print(f"    Val cls: {val_cls_loss / len(val_loader):.4f}, Val ctr: {val_ctr_loss / len(val_loader):.4f}")
+        print(f"  Contrastive weight (current): {current_contrastive_weight:.4f}")
+        print(f"  LR: {current_lr:.2e}", flush=True)
+
+        if val_losses[-1] < lowest_val_loss:
+            lowest_val_loss = val_losses[-1]
+            best_epoch = epoch + 1
+            os.makedirs(model_save_path, exist_ok=True)
+            torch.save(classifier_model.state_dict(), os.path.join(model_save_path, "model_best.pt"))
+            print(f"  ✓ Best model saved (val loss: {lowest_val_loss:.4f})")
+
+        if (epoch + 1) % 10 == 0:
+            checkpoint_path = os.path.join(model_save_path, f"model_epoch_{epoch+1}.pt")
+            torch.save(classifier_model.state_dict(), checkpoint_path)
+            print(f"  Checkpoint saved: {checkpoint_path}")
+
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accuracies, label='Train Accuracy')
+    plt.plot(val_accuracies, label='Val Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(model_save_path, plot_file))
+    print(f"Loss curve saved to {os.path.join(model_save_path, plot_file)}")
+
+    print(f"\nTraining completed!")
+    print(f"Best model at epoch {best_epoch} with val loss: {lowest_val_loss:.4f}")
+
+
 if __name__ == "__main__":
     # Configuration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -464,41 +741,37 @@ if __name__ == "__main__":
     contrastive_temperature = 0.1
     contrastive_warmup_epochs = 5
     
-    # IMPORTANT: Use pre-computed flows for fast training!
-    # Set to True to use cached flows (MUCH faster - recommended!)
-    # Set to False to compute flows on-the-fly (very slow - only for testing)
-    # NOTE: For all-tasks training, you need to precompute flows for ALL tasks first!
-    #       Update precompute_flows.py with the same task_list and run it before training.
+    # Flow-specific settings (used only by flow models).
     use_cached_flows = True
+    use_gmflow = True
     
     # Skip os.path.exists() checks during indexing - avoids ~495k stat calls on scratch
     # filesystem which would take hours before training even starts.
     skip_file_check = True
     
-    # Flow model (only needed if use_cached_flows=False)
+    # Model selection
+    model_type = "latent_video_transformer"  # Options: "simple", "convlstm", "latent_video_transformer"
+
     flow_model = None
-    if not use_cached_flows:
-        print("⚠ WARNING: Computing flows on-the-fly is VERY slow!")
-        print("  Run precompute_flows.py first, then set use_cached_flows=True")
-        use_gmflow = True
-        if use_gmflow:
-            flow_model = data.load_gmflow_model(device)
-            print("Using GMFlow for optical flow computation")
+    flow_cache_dir = os.path.join(directory, 'flow_maps')
+    if model_type in {"simple", "convlstm"}:
+        if not use_cached_flows:
+            print("⚠ WARNING: Computing flows on-the-fly is VERY slow!")
+            print("  Run precompute_flows.py first, then set use_cached_flows=True")
+            if use_gmflow:
+                flow_model = data.load_gmflow_model(device)
+                print("Using GMFlow for optical flow computation")
+            else:
+                flow_model = data.load_raft_model(device)
+                print("Using RAFT for optical flow computation")
         else:
-            flow_model = data.load_raft_model(device)
-            print("Using RAFT for optical flow computation")
-    else:
-        print("✓ Using pre-computed flow maps for fast training")
-        flow_cache_dir = os.path.join(directory, 'flow_maps')
-        if not os.path.exists(flow_cache_dir):
-            print(f"\n❌ ERROR: Flow cache not found at {flow_cache_dir}")
-            print("Run precompute_flows.py first to generate cached flows!")
-            print("Example:")
-            print("  python precompute_flows.py")
-            exit(1)
-    
-    # Model selection: choose one
-    model_type = "convlstm"  # Options: "simple" or "convlstm"
+            print("✓ Using pre-computed flow maps for fast training")
+            if not os.path.exists(flow_cache_dir):
+                print(f"\n❌ ERROR: Flow cache not found at {flow_cache_dir}")
+                print("Run precompute_flows.py first to generate cached flows!")
+                print("Example:")
+                print("  python precompute_flows.py")
+                exit(1)
     
     # Create model
     if model_type == "simple":
@@ -520,6 +793,24 @@ if __name__ == "__main__":
             dropout=0.3
         )
         model_name = "combined_convlstm"
+    elif model_type == "latent_video_transformer":
+        classifier = model.LatentVideoTransformer(
+            latent_channels=640,
+            video_channels=3,
+            d_model=128,
+            num_heads=8,
+            latent_patch_size=2,
+            video_patch_size=16,
+            latent_frames=7,
+            video_frames=8,
+            video_size=128,
+            latent_encoder_layers=2,
+            video_encoder_layers=2,
+            fusion_encoder_layers=3,
+            ff_dim=1024,
+            dropout=0.1,
+        )
+        model_name = "latent_video_transformer"
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
@@ -528,32 +819,59 @@ if __name__ == "__main__":
     
     # Train - ALL TASKS MODEL
     model_save_path = f"checkpoints_{model_name}_alltasks"
-    train_combined_model(
-        classifier_model=classifier,
-        epochs=epochs,
-        batch_size=batch_size,
-        learning_rate=learning_rate,
-        device=device,
-        val_split=val_split,
-        directory=directory,
-        task_list=task_list,
-        camera_list=camera_list,
-        episodes=episodes,
-        diffusion_time_steps=diffusion_time_steps,
-        results_json=results_json,
-        flow_model=flow_model,
-        use_gmflow=True,  # Only used if use_cached_flows=False
-        use_cached_flows=use_cached_flows,
-        flow_cache_dir=os.path.join(directory, 'flow_maps') if use_cached_flows else None,
-        load_in_memory=True,    # Load all data into RAM — eliminates disk I/O during training
-        skip_file_check=skip_file_check,
-        time_mask_prob=0.0,  # Set to 0.15 to enable time masking
-        normalize_latent=False,  # Set to True to normalize latent embeddings
-        use_contrastive_loss=use_contrastive_loss,
-        contrastive_weight=contrastive_weight,
-        contrastive_temperature=contrastive_temperature,
-        contrastive_warmup_epochs=contrastive_warmup_epochs,
-        plot_file="loss_curve.png",
-        model_save_path=model_save_path,
-        grad_accumulation_steps=grad_accumulation_steps
-    )
+    if model_type in {"simple", "convlstm"}:
+        train_combined_model(
+            classifier_model=classifier,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            device=device,
+            val_split=val_split,
+            directory=directory,
+            task_list=task_list,
+            camera_list=camera_list,
+            episodes=episodes,
+            diffusion_time_steps=diffusion_time_steps,
+            results_json=results_json,
+            flow_model=flow_model,
+            use_gmflow=use_gmflow,
+            use_cached_flows=use_cached_flows,
+            flow_cache_dir=flow_cache_dir if use_cached_flows else None,
+            load_in_memory=True,    # Load all data into RAM — eliminates disk I/O during training
+            skip_file_check=skip_file_check,
+            time_mask_prob=0.0,
+            normalize_latent=False,
+            use_contrastive_loss=use_contrastive_loss,
+            contrastive_weight=contrastive_weight,
+            contrastive_temperature=contrastive_temperature,
+            contrastive_warmup_epochs=contrastive_warmup_epochs,
+            plot_file="loss_curve.png",
+            model_save_path=model_save_path,
+            grad_accumulation_steps=grad_accumulation_steps
+        )
+    else:
+        train_latent_video_transformer_model(
+            classifier_model=classifier,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            device=device,
+            val_split=val_split,
+            directory=directory,
+            task_list=task_list,
+            camera_list=camera_list,
+            episodes=episodes,
+            diffusion_time_steps=diffusion_time_steps,
+            results_json=results_json,
+            skip_file_check=skip_file_check,
+            normalize_latent=False,
+            video_size=128,
+            num_workers=8,
+            use_contrastive_loss=use_contrastive_loss,
+            contrastive_weight=contrastive_weight,
+            contrastive_temperature=contrastive_temperature,
+            contrastive_warmup_epochs=contrastive_warmup_epochs,
+            plot_file="loss_curve.png",
+            model_save_path=model_save_path,
+            grad_accumulation_steps=grad_accumulation_steps,
+        )

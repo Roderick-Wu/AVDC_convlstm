@@ -41,16 +41,16 @@ TASKS = [
 CAMERAS = ["corner", "corner2", "corner3"]
 DIFFUSION_STEPS = [5, 15, 25, 35, 45, 55, 65, 75, 85, 95]
 
-# Test split requested: episodes 500-999 inclusive
-EPISODE_START = 500
-EPISODE_END = 999
+# Test split requested: episodes 500-599 inclusive
+EPISODE_START = 0
+EPISODE_END = 499
 
 USE_CACHED_FLOWS = True
 FLOW_CACHE_DIR = None  # Defaults to DIRECTORY/flow_maps when None
 USE_GMFLOW = True  # Only used when USE_CACHED_FLOWS=False
 
 BATCH_SIZE = 64
-NUM_WORKERS = 4
+NUM_WORKERS = 48
 NORMALIZE_LATENT = False
 SKIP_FILE_CHECK = True
 
@@ -222,6 +222,33 @@ def plot_per_task(points: np.ndarray, labels: np.ndarray, tasks: np.ndarray, tit
         )
 
 
+def plot_all_tasks_colored(points: np.ndarray, tasks: np.ndarray, title: str, out_path: str) -> None:
+    plt.figure(figsize=(12, 9))
+
+    unique_tasks = np.unique(tasks)
+    cmap = plt.get_cmap("tab20")
+
+    for i, task in enumerate(unique_tasks):
+        mask = tasks == task
+        plt.scatter(
+            points[mask, 0],
+            points[mask, 1],
+            s=5,
+            alpha=0.6,
+            color=cmap(i % 20),
+            label=task,
+        )
+
+    plt.title(title)
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.grid(alpha=0.2)
+    plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8, frameon=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
 def main() -> None:
     np.random.seed(SEED)
     torch.manual_seed(SEED)
@@ -328,6 +355,12 @@ def main() -> None:
         title="UMAP: All Tasks (colored by success/failure)",
         out_path=os.path.join(OUTPUT_DIR, "umap_all_by_label.png"),
     )
+    plot_all_tasks_colored(
+        umap_points,
+        task_array,
+        title="UMAP: All Tasks (colored by task)",
+        out_path=os.path.join(OUTPUT_DIR, "umap_all_by_task.png"),
+    )
     plot_per_task(
         umap_points,
         labels,
@@ -366,6 +399,12 @@ def main() -> None:
         title="t-SNE: Test Embeddings (colored by success/failure)",
         out_path=os.path.join(OUTPUT_DIR, "tsne_all_by_label.png"),
     )
+    plot_all_tasks_colored(
+        tsne_points,
+        tsne_tasks,
+        title="t-SNE: Test Embeddings (colored by task)",
+        out_path=os.path.join(OUTPUT_DIR, "tsne_all_by_task.png"),
+    )
     plot_per_task(
         tsne_points,
         tsne_labels,
@@ -376,7 +415,9 @@ def main() -> None:
 
     print("Done. Generated plots:")
     print(f"  {os.path.join(OUTPUT_DIR, 'umap_all_by_label.png')}")
+    print(f"  {os.path.join(OUTPUT_DIR, 'umap_all_by_task.png')}")
     print(f"  {os.path.join(OUTPUT_DIR, 'tsne_all_by_label.png')}")
+    print(f"  {os.path.join(OUTPUT_DIR, 'tsne_all_by_task.png')}")
     print(f"  {os.path.join(OUTPUT_DIR, 'umap_by_task')}")
     print(f"  {os.path.join(OUTPUT_DIR, 'tsne_by_task')}")
 

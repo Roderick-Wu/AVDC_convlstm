@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=visualize_embeddings
 #SBATCH --account=def-gigor
-#SBATCH --time=12:00:00
+#SBATCH --time=6:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=48

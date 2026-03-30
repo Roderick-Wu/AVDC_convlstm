@@ -256,6 +256,215 @@ class CombinedConvLSTM(nn.Module):
         return score
 
 
+class LatentVideoTransformer(nn.Module):
+    """
+    Transformer-based classifier for latent embeddings + raw x0 video.
+
+    Design:
+    - Latent encoder: patchifies each 8x8 latent frame and encodes with a Transformer.
+    - Video encoder: patchifies each RGB frame and encodes with a Transformer.
+    - Fusion encoder: concatenates latent frame tokens + video frame tokens + timestep token,
+      then predicts from a learnable CLS token.
+    """
+
+    def __init__(
+        self,
+        latent_channels=640,
+        video_channels=3,
+        d_model=256,
+        num_heads=8,
+        latent_patch_size=2,
+        video_patch_size=16,
+        latent_frames=7,
+        video_frames=8,
+        video_size=128,
+        latent_encoder_layers=2,
+        video_encoder_layers=2,
+        fusion_encoder_layers=3,
+        ff_dim=1024,
+        dropout=0.1,
+    ):
+        super().__init__()
+
+        self.latent_frames = latent_frames
+        self.video_frames = video_frames
+        self.video_size = video_size
+
+        # ---- Latent patch embedding ----
+        self.latent_patch_embed = nn.Conv2d(
+            latent_channels,
+            d_model,
+            kernel_size=latent_patch_size,
+            stride=latent_patch_size,
+        )
+        latent_patches_per_frame = (8 // latent_patch_size) * (8 // latent_patch_size)
+        self.latent_spatial_pos = nn.Parameter(
+            torch.randn(1, 1, latent_patches_per_frame, d_model) * 0.02
+        )
+        self.latent_temporal_pos = nn.Parameter(
+            torch.randn(1, latent_frames, 1, d_model) * 0.02
+        )
+
+        latent_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.latent_encoder = nn.TransformerEncoder(
+            latent_layer, num_layers=latent_encoder_layers
+        )
+
+        # ---- Video patch embedding ----
+        self.video_patch_embed = nn.Conv2d(
+            video_channels,
+            d_model,
+            kernel_size=video_patch_size,
+            stride=video_patch_size,
+        )
+        video_patches_per_frame = (video_size // video_patch_size) * (video_size // video_patch_size)
+        self.video_spatial_pos = nn.Parameter(
+            torch.randn(1, 1, video_patches_per_frame, d_model) * 0.02
+        )
+        self.video_temporal_pos = nn.Parameter(
+            torch.randn(1, video_frames, 1, d_model) * 0.02
+        )
+
+        video_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.video_encoder = nn.TransformerEncoder(video_layer, num_layers=video_encoder_layers)
+
+        # ---- Timestep and fusion transformer ----
+        self.timestep_proj = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        # Sequence order: [CLS] + latent_frame_tokens + video_frame_tokens + timestep_token
+        self.fusion_pos = nn.Parameter(
+            torch.randn(1, 1 + latent_frames + video_frames + 1, d_model) * 0.02
+        )
+
+        fusion_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.fusion_encoder = nn.TransformerEncoder(
+            fusion_layer, num_layers=fusion_encoder_layers
+        )
+
+        self.norm = nn.LayerNorm(d_model)
+        self.pre_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.head = nn.Linear(d_model, 1)
+
+    def _encode_latent(self, latent):
+        # latent: (B, 640, 7, 8, 8)
+        bsz, channels, t_lat, h_lat, w_lat = latent.shape
+        if t_lat != self.latent_frames:
+            raise ValueError(f"Expected {self.latent_frames} latent frames, got {t_lat}")
+
+        latent_bt = latent.permute(0, 2, 1, 3, 4).reshape(bsz * t_lat, channels, h_lat, w_lat)
+        latent_tokens = self.latent_patch_embed(latent_bt)  # (B*T, D, Hp, Wp)
+        latent_tokens = latent_tokens.flatten(2).transpose(1, 2)  # (B*T, Np, D)
+
+        n_patches = latent_tokens.size(1)
+        latent_tokens = latent_tokens.view(bsz, t_lat, n_patches, -1)
+        latent_tokens = (
+            latent_tokens
+            + self.latent_spatial_pos[:, :, :n_patches, :]
+            + self.latent_temporal_pos[:, :t_lat, :, :]
+        )
+
+        latent_tokens = latent_tokens.view(bsz, t_lat * n_patches, -1)
+        latent_tokens = self.latent_encoder(latent_tokens)
+        latent_tokens = latent_tokens.view(bsz, t_lat, n_patches, -1)
+
+        # Collapse spatial patches to one token per latent timestep.
+        return latent_tokens.mean(dim=2)  # (B, T_lat, D)
+
+    def _encode_video(self, video):
+        # video: (B, 3, 8, H, W)
+        bsz, channels, t_vid, h_vid, w_vid = video.shape
+        if t_vid != self.video_frames:
+            raise ValueError(f"Expected {self.video_frames} video frames, got {t_vid}")
+
+        video_bt = video.permute(0, 2, 1, 3, 4).reshape(bsz * t_vid, channels, h_vid, w_vid)
+        if (h_vid, w_vid) != (self.video_size, self.video_size):
+            video_bt = F.interpolate(
+                video_bt,
+                size=(self.video_size, self.video_size),
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        video_tokens = self.video_patch_embed(video_bt)  # (B*T, D, Hp, Wp)
+        video_tokens = video_tokens.flatten(2).transpose(1, 2)  # (B*T, Np, D)
+
+        n_patches = video_tokens.size(1)
+        video_tokens = video_tokens.view(bsz, t_vid, n_patches, -1)
+        video_tokens = (
+            video_tokens
+            + self.video_spatial_pos[:, :, :n_patches, :]
+            + self.video_temporal_pos[:, :t_vid, :, :]
+        )
+
+        video_tokens = video_tokens.view(bsz, t_vid * n_patches, -1)
+        video_tokens = self.video_encoder(video_tokens)
+        video_tokens = video_tokens.view(bsz, t_vid, n_patches, -1)
+
+        # Collapse spatial patches to one token per video timestep.
+        return video_tokens.mean(dim=2)  # (B, T_vid, D)
+
+    def forward(self, latent, video, timestep, return_embedding=False):
+        """
+        Args:
+            latent: (B, 640, 7, 8, 8)
+            video: (B, 3, 8, H, W) raw x0 video frames (with condition frame)
+            timestep: (B, 1)
+
+        Returns:
+            score: (B, 1) logits
+        """
+        if video.max() > 1.0:
+            video = video / 255.0
+
+        latent_frame_tokens = self._encode_latent(latent)
+        video_frame_tokens = self._encode_video(video)
+        timestep_token = self.timestep_proj(timestep).unsqueeze(1)  # (B, 1, D)
+
+        bsz = latent.size(0)
+        cls = self.cls_token.expand(bsz, -1, -1)
+        fused = torch.cat([cls, latent_frame_tokens, video_frame_tokens, timestep_token], dim=1)
+        fused = fused + self.fusion_pos[:, :fused.size(1), :]
+
+        fused = self.fusion_encoder(fused)
+        cls_out = self.norm(fused[:, 0])
+        embedding = self.pre_head(cls_out)
+        score = self.head(embedding)
+
+        if return_embedding:
+            return score, embedding
+        return score
+
+
 def random_time_masking(x, mask_prob=0.15):
     """
     Randomly mask out entire time steps during training for regularization.

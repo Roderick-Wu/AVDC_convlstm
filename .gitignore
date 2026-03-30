@@ -1,4 +1,7 @@
+.env
+__pycache__
 *.out
-checkpoints_combined_convlstm/
+*plots*
+checkpoints_*/
 *.out
 *.log
