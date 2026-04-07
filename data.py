@@ -323,6 +323,137 @@ class LatentRawVideoDataset(Dataset):
         return latent, video, t, y
 
 
+class InMemoryLatentRawVideoDataset(Dataset):
+    """
+    In-memory variant of LatentRawVideoDataset.
+
+    Loads all latent embeddings and resized raw x0 videos into RAM once to remove
+    per-batch disk and GIF decode overhead during training.
+    """
+
+    def __init__(
+        self,
+        episode_info_list,
+        normalize_latent=False,
+        latent_mean=None,
+        latent_std=None,
+        video_size=128,
+        num_load_workers=32,
+        latent_dtype=np.float16,
+        video_dtype=np.float16,
+    ):
+        self.episode_info_list = episode_info_list
+        n = len(episode_info_list)
+        print(f"  Loading {n:,} samples into RAM with {num_load_workers} threads...", flush=True)
+
+        info0 = episode_info_list[0]
+        lat0 = np.load(info0['latent_path'])
+        if lat0.ndim == 5:
+            lat0 = lat0[0]
+
+        x0_frames0 = load_video_frames(info0['x0_path'])
+        if len(x0_frames0) == 8:
+            frames0 = x0_frames0
+        elif len(x0_frames0) == 7:
+            frames0 = [load_condition_frame(info0['condition_path'])] + x0_frames0
+        else:
+            raise ValueError(
+                f"Expected x0 gif with 7 or 8 frames, got {len(x0_frames0)}: {info0['x0_path']}"
+            )
+
+        video0 = torch.stack(frames0, dim=0)  # (T, C, H, W)
+        if video_size is not None and (
+            video0.shape[-2] != video_size or video0.shape[-1] != video_size
+        ):
+            video0 = F.interpolate(
+                video0,
+                size=(video_size, video_size),
+                mode='bilinear',
+                align_corners=False,
+            )
+        video0 = video0.permute(1, 0, 2, 3).contiguous()  # (C, T, H, W)
+
+        latent_shape = lat0.shape
+        video_shape = tuple(video0.shape)
+
+        self.latents = np.empty((n, *latent_shape), dtype=latent_dtype)
+        self.videos = np.empty((n, *video_shape), dtype=video_dtype)
+        self.timesteps = np.empty(n, dtype=np.float32)
+        self.labels = np.empty(n, dtype=np.float32)
+
+        latent_mem_gb = self.latents.nbytes / 1024**3
+        video_mem_gb = self.videos.nbytes / 1024**3
+        print(f"  Latent array:  {latent_mem_gb:.1f} GB  dtype={self.latents.dtype} shape={latent_shape}")
+        print(f"  Video array:   {video_mem_gb:.1f} GB  dtype={self.videos.dtype} shape={video_shape}")
+        print(f"  Total RAM:     {latent_mem_gb + video_mem_gb:.1f} GB", flush=True)
+
+        lock = threading.Lock()
+        progress = [0]
+
+        def load_one(args):
+            idx, info = args
+
+            latent = np.load(info['latent_path'])
+            if latent.ndim == 5:
+                latent = latent[0]
+            if normalize_latent and latent_mean is not None and latent_std is not None:
+                latent = (latent - latent_mean) / (latent_std + 1e-8)
+
+            x0_frames = load_video_frames(info['x0_path'])
+            if len(x0_frames) == 8:
+                frames = x0_frames
+            elif len(x0_frames) == 7:
+                condition = load_condition_frame(info['condition_path'])
+                frames = [condition] + x0_frames
+            else:
+                raise ValueError(
+                    f"Expected x0 gif with 7 or 8 frames, got {len(x0_frames)}: {info['x0_path']}"
+                )
+
+            video_tchw = torch.stack(frames, dim=0)
+            if video_size is not None and (
+                video_tchw.shape[-2] != video_size or video_tchw.shape[-1] != video_size
+            ):
+                video_tchw = F.interpolate(
+                    video_tchw,
+                    size=(video_size, video_size),
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            video = video_tchw.permute(1, 0, 2, 3).contiguous()
+
+            self.latents[idx] = latent.astype(latent_dtype)
+            self.videos[idx] = video.numpy().astype(video_dtype)
+            self.timesteps[idx] = float(info['timestep'])
+            self.labels[idx] = float(info['label'])
+
+            with lock:
+                progress[0] += 1
+                if progress[0] % 5000 == 0:
+                    print(f"    {progress[0]:,}/{n:,} loaded...", flush=True)
+
+        with ThreadPoolExecutor(max_workers=num_load_workers) as ex:
+            list(ex.map(load_one, enumerate(episode_info_list)))
+
+        print(f"  All {n:,} samples loaded into RAM.", flush=True)
+
+        self.latents = torch.from_numpy(self.latents)
+        self.videos = torch.from_numpy(self.videos)
+        self.timesteps = torch.from_numpy(self.timesteps)
+        self.labels = torch.from_numpy(self.labels)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return (
+            self.latents[idx].float(),
+            self.videos[idx].float(),
+            self.timesteps[idx].unsqueeze(0),
+            self.labels[idx].unsqueeze(0),
+        )
+
+
 def load_video_frames(video_path):
     """
     Load all frames from a GIF video.

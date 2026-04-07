@@ -386,16 +386,16 @@ class LatentVideoTransformer(nn.Module):
         latent_tokens = latent_tokens.flatten(2).transpose(1, 2)  # (B*T, Np, D)
 
         n_patches = latent_tokens.size(1)
-        latent_tokens = latent_tokens.view(bsz, t_lat, n_patches, -1)
+        latent_tokens = latent_tokens.reshape(bsz, t_lat, n_patches, -1)
         latent_tokens = (
             latent_tokens
             + self.latent_spatial_pos[:, :, :n_patches, :]
             + self.latent_temporal_pos[:, :t_lat, :, :]
         )
 
-        latent_tokens = latent_tokens.view(bsz, t_lat * n_patches, -1)
+        latent_tokens = latent_tokens.reshape(bsz, t_lat * n_patches, -1)
         latent_tokens = self.latent_encoder(latent_tokens)
-        latent_tokens = latent_tokens.view(bsz, t_lat, n_patches, -1)
+        latent_tokens = latent_tokens.reshape(bsz, t_lat, n_patches, -1)
 
         # Collapse spatial patches to one token per latent timestep.
         return latent_tokens.mean(dim=2)  # (B, T_lat, D)
@@ -419,16 +419,16 @@ class LatentVideoTransformer(nn.Module):
         video_tokens = video_tokens.flatten(2).transpose(1, 2)  # (B*T, Np, D)
 
         n_patches = video_tokens.size(1)
-        video_tokens = video_tokens.view(bsz, t_vid, n_patches, -1)
+        video_tokens = video_tokens.reshape(bsz, t_vid, n_patches, -1)
         video_tokens = (
             video_tokens
             + self.video_spatial_pos[:, :, :n_patches, :]
             + self.video_temporal_pos[:, :t_vid, :, :]
         )
 
-        video_tokens = video_tokens.view(bsz, t_vid * n_patches, -1)
+        video_tokens = video_tokens.reshape(bsz, t_vid * n_patches, -1)
         video_tokens = self.video_encoder(video_tokens)
-        video_tokens = video_tokens.view(bsz, t_vid, n_patches, -1)
+        video_tokens = video_tokens.reshape(bsz, t_vid, n_patches, -1)
 
         # Collapse spatial patches to one token per video timestep.
         return video_tokens.mean(dim=2)  # (B, T_vid, D)

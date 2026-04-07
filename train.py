@@ -439,6 +439,8 @@ def train_latent_video_transformer_model(
           skip_file_check=False,
           normalize_latent=False,
           video_size=128,
+          load_in_memory=False,
+          num_load_workers=32,
           num_workers=8,
           use_contrastive_loss=False,
           contrastive_weight=0.1,
@@ -479,20 +481,43 @@ def train_latent_video_transformer_model(
     if normalize_latent:
         latent_mean, latent_std = data.compute_latent_statistics(train_info_list, sample_size=100)
 
-    train_dataset = data.LatentRawVideoDataset(
-        episode_info_list=train_info_list,
-        normalize_latent=normalize_latent,
-        latent_mean=latent_mean,
-        latent_std=latent_std,
-        video_size=video_size,
-    )
-    val_dataset = data.LatentRawVideoDataset(
-        episode_info_list=val_info_list,
-        normalize_latent=normalize_latent,
-        latent_mean=latent_mean,
-        latent_std=latent_std,
-        video_size=video_size,
-    )
+    if load_in_memory:
+        print("\n📦 Loading ENTIRE latent+video dataset into RAM...")
+        print("  Training set:")
+        train_dataset = data.InMemoryLatentRawVideoDataset(
+            episode_info_list=train_info_list,
+            normalize_latent=normalize_latent,
+            latent_mean=latent_mean,
+            latent_std=latent_std,
+            video_size=video_size,
+            num_load_workers=num_load_workers,
+        )
+        print("  Validation set:")
+        val_dataset = data.InMemoryLatentRawVideoDataset(
+            episode_info_list=val_info_list,
+            normalize_latent=normalize_latent,
+            latent_mean=latent_mean,
+            latent_std=latent_std,
+            video_size=video_size,
+            num_load_workers=num_load_workers,
+        )
+        loader_workers = 0
+    else:
+        train_dataset = data.LatentRawVideoDataset(
+            episode_info_list=train_info_list,
+            normalize_latent=normalize_latent,
+            latent_mean=latent_mean,
+            latent_std=latent_std,
+            video_size=video_size,
+        )
+        val_dataset = data.LatentRawVideoDataset(
+            episode_info_list=val_info_list,
+            normalize_latent=normalize_latent,
+            latent_mean=latent_mean,
+            latent_std=latent_std,
+            video_size=video_size,
+        )
+        loader_workers = num_workers
 
     print(f"Train Dataset size: {len(train_dataset)}")
     print(f"Validation Dataset size: {len(val_dataset)}")
@@ -514,17 +539,17 @@ def train_latent_video_transformer_model(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=loader_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=(num_workers > 0),
+        persistent_workers=(loader_workers > 0),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=loader_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=(num_workers > 0),
+        persistent_workers=(loader_workers > 0),
     )
 
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -866,6 +891,8 @@ if __name__ == "__main__":
             skip_file_check=skip_file_check,
             normalize_latent=False,
             video_size=128,
+            load_in_memory=True,
+            num_load_workers=64,
             num_workers=8,
             use_contrastive_loss=use_contrastive_loss,
             contrastive_weight=contrastive_weight,
